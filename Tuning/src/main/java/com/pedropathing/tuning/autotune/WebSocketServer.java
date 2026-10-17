@@ -8,6 +8,9 @@ import fi.iki.elonen.NanoWSD;
 import java.io.IOException;
 import java.lang.reflect.Type;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 
 public class WebSocketServer extends NanoWSD {
     private static final JsonSerializer<Inputs.Field<?>> inputFieldSerializer = (
@@ -97,6 +100,83 @@ public class WebSocketServer extends NanoWSD {
         return message;
     }
 
+    /**
+     * The currently claimed socket, or {@code null}. O(1) field read.
+     */
+    static Socket activeSocket() {
+        synchronized (socketLock) {
+            return activeSocket;
+        }
+    }
+
+    /**
+     * Shared kill routine for a dead or failing socket (watchdog path). Never
+     * blocks on a socket instance monitor from the caller:
+     * <ol>
+     *     <li>clears the claim under {@code socketLock} (O(1) field ops only
+     *     — never I/O, pings, closes or session aborts under that lock);</li>
+     *     <li>sends the close frame fire-and-forget on the ping executor (a
+     *     send can block for minutes under TCP backpressure);</li>
+     *     <li>forcibly closes the raw handshake input stream so the reader
+     *     thread parked in {@code read()} unblocks; its
+     *     {@code onException -> doClose} closes the output stream too, which
+     *     aborts any writer stuck on this socket;</li>
+     *     <li>aborts the session (idempotent).</li>
+     * </ol>
+     * Only safe to call inline from a thread that does NOT hold the socket's
+     * instance monitor (the watchdog thread holds no locks; see
+     * {@link #forceCloseAfterWriteFailure} for the write-failure case, which
+     * defers step 4 to the ping executor).
+     */
+    static void forceClose(Socket socket, WebSocketFrame.CloseCode code, String reason) {
+        releaseClaim(socket);
+        teardown(socket, code, reason);
+        socket.abortSession();
+    }
+
+    /**
+     * {@link #forceClose} for a write failure on {@code socket}: the caller
+     * (a failed {@code sendMessage}) holds the socket's instance monitor.
+     * Steps 1-3 run as usual, but the session abort is deferred to the ping
+     * executor: taking {@code sessionLock} while holding the instance monitor
+     * would invert the existing {@code sessionLock -> instanceMonitor} order
+     * (the Pedro-Tuning thread holds {@code sessionLock} across blocking sends
+     * in {@code sendWhileRunning}) and could deadlock.
+     */
+    static void forceCloseAfterWriteFailure(Socket socket, WebSocketFrame.CloseCode code, String reason) {
+        releaseClaim(socket);
+        teardown(socket, code, reason);
+        runOnPingExecutor(socket::abortSession);
+    }
+
+    private static void releaseClaim(Socket socket) {
+        synchronized (socketLock) {
+            if (activeSocket == socket) activeSocket = null;
+        }
+    }
+
+    private static void teardown(Socket socket, WebSocketFrame.CloseCode code, String reason) {
+        runOnPingExecutor(() -> {
+            try {
+                socket.close(code, reason, false);
+            } catch (IOException ignored) {
+            }
+        });
+        try {
+            socket.getHandshakeRequest().getInputStream().close();
+        } catch (IOException ignored) {
+        }
+    }
+
+    static void runOnPingExecutor(Runnable task) {
+        ExecutorService executor = ConnectionWatchdog.pingExecutor();
+        if (executor == null) return;
+        try {
+            executor.execute(task);
+        } catch (RejectedExecutionException ignored) {
+        }
+    }
+
     @Override
     protected WebSocket openWebSocket(IHTTPSession handshake) {
         return new Socket(handshake);
@@ -181,8 +261,20 @@ public class WebSocketServer extends NanoWSD {
         }
     }
 
-    private static final class Socket extends WebSocket implements TuningSession.Transport {
+    // Package-private so ConnectionWatchdog and JVM tests in this package can
+    // observe and drive sockets. Not part of the public API.
+    static final class Socket extends WebSocket implements TuningSession.Transport {
         private TuningSession session;
+
+        // Liveness bookkeeping. pendingSinceNanos, lastPongNanos, probeLatch and
+        // pingSendFuture are volatile: they are written by the ping executor and
+        // the reader thread (onPong) and read by the watchdog thread. They must
+        // only be touched with volatile field ops, never under a lock.
+        // consecutiveMisses is confined to the single watchdog thread.
+        volatile long pendingSinceNanos;
+        volatile long lastPongNanos;
+        int consecutiveMisses;
+        volatile CompletableFuture<Void> pingSendFuture;
 
         Socket(IHTTPSession handshake) {
             super(handshake);
@@ -325,6 +417,10 @@ public class WebSocketServer extends NanoWSD {
 
         @Override
         protected void onPong(WebSocketFrame pong) {
+            // Runs on the reader thread: volatile field writes only, no locks,
+            // any-pong policy. Any pong counts as liveness.
+            lastPongNanos = System.nanoTime();
+            pendingSinceNanos = 0;
         }
 
         @Override

@@ -26,6 +26,7 @@ class Hooks {
             try {
                 server.start();
                 wsServer.start(Integer.MAX_VALUE);
+                ConnectionWatchdog.start();
             } catch (IOException e) {
                 stop();
                 throw new RuntimeException(e);
@@ -42,6 +43,10 @@ class Hooks {
 
     private static void stop() {
         TuningSession.abort();
+        // Shut the watchdog down before the servers: no tick may fire
+        // force-close on a socket whose server is already stopping, and no
+        // watchdog threads may outlive the event loop.
+        ConnectionWatchdog.stop();
         if (wsServer != null) {
             wsServer.stop();
             wsServer = null;
