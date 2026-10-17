@@ -9,8 +9,10 @@ import java.io.IOException;
 import java.lang.reflect.Type;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 
 public class WebSocketServer extends NanoWSD {
     private static final JsonSerializer<Inputs.Field<?>> inputFieldSerializer = (
@@ -68,6 +70,10 @@ public class WebSocketServer extends NanoWSD {
 
     private static final Object socketLock = new Object();
     private static Socket activeSocket;
+
+    // Serializes admission (probe + takeover decision) across racing newcomer
+    // connections. Outermost lock on the newcomer's handler thread only.
+    private static final Object takeoverMonitor = new Object();
 
 
     public WebSocketServer() {
@@ -275,6 +281,9 @@ public class WebSocketServer extends NanoWSD {
         volatile long lastPongNanos;
         int consecutiveMisses;
         volatile CompletableFuture<Void> pingSendFuture;
+        // Non-null only while a takeover probe is pending on this socket;
+        // onPong counts it down when non-null.
+        volatile CountDownLatch probeLatch;
 
         Socket(IHTTPSession handshake) {
             super(handshake);
@@ -282,11 +291,85 @@ public class WebSocketServer extends NanoWSD {
 
         @Override
         protected void onOpen() {
-            if (claim()) return;
-            closeQuietly(
-                    WebSocketFrame.CloseCode.PolicyViolation,
-                    "A tuning client is already connected."
-            );
+            synchronized (takeoverMonitor) {
+                while (true) {
+                    Socket old;
+                    synchronized (socketLock) {
+                        old = activeSocket;
+                    }
+                    if (old == null) {
+                        claim();
+                        return;
+                    }
+
+                    if (probeAlive(old)) {
+                        // The existing client answered the probe: second-tab
+                        // case. Reject exactly as before (byte-identical close
+                        // code and reason for UI compatibility).
+                        closeQuietly(
+                                WebSocketFrame.CloseCode.PolicyViolation,
+                                "A tuning client is already connected."
+                        );
+                        return;
+                    }
+
+                    // Old client did not answer within the probe deadline.
+                    // Re-check the claim: it may have been released or stolen
+                    // while we were probing.
+                    synchronized (socketLock) {
+                        if (activeSocket == null) {
+                            activeSocket = this;
+                            return;
+                        }
+                        if (activeSocket != old) {
+                            // A third socket claimed during the probe
+                            // (defensive): go probe that one instead.
+                            continue;
+                        }
+                        // Steal the claim FIRST: in-flight old-session sends
+                        // now fail isCurrent() and unwind instead of leaking
+                        // onto this connection.
+                        activeSocket = this;
+                    }
+                    reclaim(old);
+                    return;
+                }
+            }
+        }
+
+        /**
+         * Liveness probe of {@code old}: register the probe latch, send one
+         * probe ping, and wait up to the probe deadline for any pong. A stuck
+         * or failed probe send also registers as no-liveness (it ages the
+         * pending bookkeeping / fails the future).
+         */
+        private boolean probeAlive(Socket old) {
+            old.probeLatch = new CountDownLatch(1);
+            ConnectionWatchdog.submitPing(old);
+            boolean alive;
+            try {
+                alive = old.probeLatch.await(ConnectionWatchdog.PROBE_DEADLINE_MS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                // Conservative: an interrupted admission never steals.
+                alive = true;
+            }
+            old.probeLatch = null;
+            return alive;
+        }
+
+        /**
+         * Steps 2-4 of the kill routine on the freshly de-claimed old socket.
+         * The close frame is fire-and-forget (it can block on a dead link);
+         * closing the raw input stream unblocks the old reader thread (its
+         * {@code onException -> doClose} also aborts any stuck writer); the
+         * session abort is explicit because the old socket's later
+         * {@code onClose -> release()} will no-op (the claim already moved).
+         * No-ops when the old socket held the claim but had no session yet.
+         */
+        private static void reclaim(Socket old) {
+            teardown(old, WebSocketFrame.CloseCode.GoingAway, "Tuning client unresponsive.");
+            old.abortSession();
         }
 
         @Override
@@ -418,9 +501,12 @@ public class WebSocketServer extends NanoWSD {
         @Override
         protected void onPong(WebSocketFrame pong) {
             // Runs on the reader thread: volatile field writes only, no locks,
-            // any-pong policy. Any pong counts as liveness.
+            // any-pong policy. Any pong counts as liveness, and any pong also
+            // completes a pending takeover probe.
             lastPongNanos = System.nanoTime();
             pendingSinceNanos = 0;
+            CountDownLatch latch = probeLatch;
+            if (latch != null) latch.countDown();
         }
 
         @Override
