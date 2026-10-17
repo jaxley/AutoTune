@@ -544,7 +544,20 @@ public class WebSocketServer extends NanoWSD {
             if (!isCurrent() || !isOpen()) {
                 throw new IOException("The tuning client is disconnected.");
             }
-            super.send(GSON.toJson(message));
+            try {
+                super.send(GSON.toJson(message));
+            } catch (IOException exception) {
+                // The stream is broken (RST/EPIPE): reclaim the connection so
+                // the claim and session cannot leak on a dead socket. This
+                // variant defers the session abort to the ping executor
+                // because this thread holds the socket instance monitor.
+                WebSocketServer.forceCloseAfterWriteFailure(
+                        this,
+                        WebSocketFrame.CloseCode.AbnormalClosure,
+                        "Tuning client write failed."
+                );
+                throw exception;
+            }
         }
 
         private void fail(String message, Throwable failure) {
