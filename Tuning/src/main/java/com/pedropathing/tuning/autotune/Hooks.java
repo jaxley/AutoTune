@@ -3,6 +3,8 @@ package com.pedropathing.tuning.autotune;
 import com.qualcomm.robotcore.eventloop.opmode.OpModeManagerImpl;
 import dev.frozenmilk.sinister.sdk.apphooks.OnCreateEventLoop;
 import dev.frozenmilk.sinister.sdk.apphooks.OnDestroy;
+import dev.frozenmilk.sinister.sdk.opmodes.SinisterRegisteredOpModes;
+import org.firstinspires.ftc.robotcore.internal.opmode.OpModeMeta;
 
 import java.io.IOException;
 
@@ -59,5 +61,68 @@ class Hooks {
 
     static OpModeManagerImpl getOpModeManager() {
         return opModeManager;
+    }
+
+    /**
+     * Seam for JVM tests: the FTC {@link OpModeManagerImpl} and Sinister calls
+     * are not usable on the JVM, so {@link Procedure#runOpMode} routes its op
+     * mode lifecycle through this interface. The default implementation is the
+     * exact production behavior; tests override the instance.
+     */
+    interface OpModeRunner {
+        void register(OpModeMeta meta, TuningOpMode<?> opMode);
+
+        void init(OpModeMeta meta);
+
+        void startActiveOpMode();
+
+        void requestOpModeStop(TuningOpMode<?> opMode);
+
+        void unregister(OpModeMeta meta);
+    }
+
+    private static volatile OpModeRunner opModeRunner;
+
+    static OpModeRunner getOpModeRunner() {
+        OpModeRunner runner = opModeRunner;
+        if (runner == null) {
+            runner = defaultOpModeRunner();
+            opModeRunner = runner;
+        }
+        return runner;
+    }
+
+    // Test seam: install a recording/fake runner.
+    static void setOpModeRunner(OpModeRunner runner) {
+        opModeRunner = runner;
+    }
+
+    private static OpModeRunner defaultOpModeRunner() {
+        return new OpModeRunner() {
+            @Override
+            public void register(OpModeMeta meta, TuningOpMode<?> opMode) {
+                SinisterRegisteredOpModes.INSTANCE.register(meta, opMode);
+            }
+
+            @Override
+            public void init(OpModeMeta meta) {
+                opModeManager.initOpMode(meta.name);
+            }
+
+            @Override
+            public void startActiveOpMode() {
+                opModeManager.startActiveOpMode();
+            }
+
+            @Override
+            public void requestOpModeStop(TuningOpMode<?> opMode) {
+                opModeManager.requestOpModeStop(opMode);
+            }
+
+            @Override
+            public void unregister(OpModeMeta meta) {
+                SinisterRegisteredOpModes.INSTANCE.unregister(meta);
+            }
+        };
     }
 }

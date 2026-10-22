@@ -1,7 +1,5 @@
 package com.pedropathing.tuning.autotune;
 
-import com.qualcomm.robotcore.eventloop.opmode.OpModeManagerImpl;
-import dev.frozenmilk.sinister.sdk.opmodes.SinisterRegisteredOpModes;
 import org.firstinspires.ftc.robotcore.internal.opmode.OpModeMeta;
 
 import java.util.LinkedHashMap;
@@ -86,17 +84,17 @@ public abstract class Procedure {
                 .setFlavor(OpModeMeta.Flavor.UTILITY)
                 .build();
 
-        OpModeManagerImpl manager = Hooks.getOpModeManager();
-        SinisterRegisteredOpModes.INSTANCE.register(meta, opMode);
+        Hooks.OpModeRunner runner = Hooks.getOpModeRunner();
+        runner.register(meta, opMode);
         try {
-            manager.initOpMode(meta.name);
-            manager.startActiveOpMode();
+            runner.init(meta);
+            runner.startActiveOpMode();
             TuningSession.opModeStarted(opMode, currentDisplay);
             return opMode.awaitResult();
         } finally {
             TuningSession.opModeFinished(opMode);
-            manager.requestOpModeStop(opMode);
-            SinisterRegisteredOpModes.INSTANCE.unregister(meta);
+            runner.requestOpModeStop(opMode);
+            runner.unregister(meta);
         }
     }
 

@@ -77,7 +77,12 @@ public class WebSocketServer extends NanoWSD {
 
 
     public WebSocketServer() {
-        super(12649);
+        this(12649);
+    }
+
+    // Test seam: ephemeral port for JVM tests.
+    WebSocketServer(int port) {
+        super(port);
     }
 
     private static String getDisplayName(Enum<?> option) {
@@ -113,6 +118,18 @@ public class WebSocketServer extends NanoWSD {
         synchronized (socketLock) {
             return activeSocket;
         }
+    }
+
+    /**
+     * Test-only reset of all static connection state: drops the claim, aborts
+     * any running session and clears the registrar. Never call in production.
+     */
+    static void clearForTest() {
+        synchronized (socketLock) {
+            activeSocket = null;
+        }
+        TuningSession.abort();
+        TunerRegistrar.deregisterAll();
     }
 
     /**
@@ -267,9 +284,10 @@ public class WebSocketServer extends NanoWSD {
         }
     }
 
-    // Package-private so ConnectionWatchdog and JVM tests in this package can
-    // observe and drive sockets. Not part of the public API.
-    static final class Socket extends WebSocket implements TuningSession.Transport {
+    // Package-private (and non-final so tests can subclass for fault injection)
+    // so ConnectionWatchdog and JVM tests in this package can observe and drive
+    // sockets. Not part of the public API.
+    static class Socket extends WebSocket implements TuningSession.Transport {
         private TuningSession session;
 
         // Liveness bookkeeping. pendingSinceNanos, lastPongNanos, probeLatch and

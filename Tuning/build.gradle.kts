@@ -30,6 +30,20 @@ android {
         targetCompatibility = JavaVersion.VERSION_1_8
     }
 
+    testOptions {
+        unitTests {
+            // Keep android.util.Log usage as-is in production sources; unit
+            // tests stub its methods instead (zero source diff for tests).
+            isReturnDefaultValues = true
+        }
+        unitTests.all {
+            // The tuning server owns global static state (claim, session
+            // registry, watchdog); isolate each test class in its own JVM.
+            it.setForkEvery(1)
+            it.maxParallelForks = 1
+        }
+    }
+
     publishing {
         singleVariant("release") {
             withSourcesJar()
@@ -48,6 +62,14 @@ dependencies {
     implementation("org.nanohttpd:nanohttpd-websocket:2.3.1") {
         exclude(module = "nanohttpd")
     }
+    testImplementation("junit:junit:4.13.2")
+    // Well-behaved websocket client for JVM tests (real sockets on localhost).
+    testImplementation("org.java-websocket:Java-WebSocket:1.5.7")
+    // compileOnly deps are not on the unit-test classpath; repeat them so JVM
+    // tests can compile against (and load) the FTC types the library touches.
+    testImplementation("org.firstinspires.ftc:RobotCore:11.2.1")
+    testImplementation("org.firstinspires.ftc:FtcCommon:11.2.1")
+    testImplementation("org.firstinspires.ftc:RobotServer:11.2.1")
 }
 
 val dokkaJar = tasks.register<Jar>("dokkaJar") {
