@@ -193,10 +193,17 @@ public class WebSocketServer extends NanoWSD {
 
     static void runOnPingExecutor(Runnable task) {
         ExecutorService executor = ConnectionWatchdog.pingExecutor();
-        if (executor == null) return;
+        if (executor == null) {
+            // Only reachable after ConnectionWatchdog.stop() (event-loop
+            // recycle), where the session registry is torn down anyway — but
+            // make the drop observable instead of silent.
+            Log.w("WebSocketServer", "ping executor unavailable; deferred task dropped");
+            return;
+        }
         try {
             executor.execute(task);
-        } catch (RejectedExecutionException ignored) {
+        } catch (RejectedExecutionException exception) {
+            Log.w("WebSocketServer", "ping executor rejected task; deferred task dropped", exception);
         }
     }
 
@@ -288,15 +295,17 @@ public class WebSocketServer extends NanoWSD {
     // so ConnectionWatchdog and JVM tests in this package can observe and drive
     // sockets. Not part of the public API.
     static class Socket extends WebSocket implements TuningSession.Transport {
-        private TuningSession session;
+        // Volatile: read cross-thread by the watchdog / ping-executor /
+        // newcomer-handler abort paths (forceClose, reclaim); visibility must
+        // not depend on the incidental socketLock ordering.
+        private volatile TuningSession session;
 
-        // Liveness bookkeeping. pendingSinceNanos, lastPongNanos, probeLatch and
+        // Liveness bookkeeping. pendingSinceNanos, probeLatch and
         // pingSendFuture are volatile: they are written by the ping executor and
         // the reader thread (onPong) and read by the watchdog thread. They must
         // only be touched with volatile field ops, never under a lock.
         // consecutiveMisses is confined to the single watchdog thread.
         volatile long pendingSinceNanos;
-        volatile long lastPongNanos;
         int consecutiveMisses;
         volatile CompletableFuture<Void> pingSendFuture;
         // Non-null only while a takeover probe is pending on this socket;
@@ -521,7 +530,6 @@ public class WebSocketServer extends NanoWSD {
             // Runs on the reader thread: volatile field writes only, no locks,
             // any-pong policy. Any pong counts as liveness, and any pong also
             // completes a pending takeover probe.
-            lastPongNanos = System.nanoTime();
             pendingSinceNanos = 0;
             CountDownLatch latch = probeLatch;
             if (latch != null) latch.countDown();

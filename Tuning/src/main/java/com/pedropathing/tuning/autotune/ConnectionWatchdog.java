@@ -4,12 +4,10 @@ import fi.iki.elonen.NanoWSD;
 
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -61,7 +59,6 @@ final class ConnectionWatchdog {
 
     private static volatile ScheduledExecutorService scheduler;
     private static volatile ExecutorService pingExecutor;
-    private static volatile ScheduledFuture<?> tickTask;
 
     private ConnectionWatchdog() {}
 
@@ -82,7 +79,7 @@ final class ConnectionWatchdog {
         scheduler = newScheduler;
         pingExecutor = newPingExecutor;
         long interval = PING_INTERVAL_MS;
-        tickTask = newScheduler.scheduleAtFixedRate(
+        newScheduler.scheduleAtFixedRate(
                 ConnectionWatchdog::tick,
                 interval,
                 interval,
@@ -98,7 +95,6 @@ final class ConnectionWatchdog {
     static synchronized void stop() {
         ScheduledExecutorService stoppingScheduler = scheduler;
         ExecutorService stoppingPingExecutor = pingExecutor;
-        tickTask = null;
         scheduler = null;
         pingExecutor = null;
 
@@ -117,13 +113,22 @@ final class ConnectionWatchdog {
      * write fails, and may never complete if the write is stuck; both register
      * as liveness failures on a later tick (or, while the watchdog is disabled,
      * during a takeover probe where a failed send also counts as no-liveness).
+     *
+     * <p>On rejection (watchdog stopped) the future completes exceptionally but
+     * is <em>not</em> recorded into {@code pingSendFuture}: submission never
+     * happened, so there is no outstanding send to track. The already-recorded
+     * {@code pendingSinceNanos} deliberately stays, so a claimed socket that
+     * survives an event-loop recycle is reclaimed on the next start.</p>
      */
     static CompletableFuture<Void> submitPing(WebSocketServer.Socket socket) {
         socket.pendingSinceNanos = System.nanoTime();
         CompletableFuture<Void> future = new CompletableFuture<>();
+        ExecutorService executor = pingExecutor;
+        if (executor == null) {
+            future.completeExceptionally(new RejectedExecutionException("watchdog stopped"));
+            return future;
+        }
         try {
-            ExecutorService executor = pingExecutor;
-            if (executor == null) throw new RejectedExecutionException("watchdog stopped");
             executor.execute(() -> {
                 try {
                     socket.ping(PING_PAYLOAD);
@@ -134,6 +139,7 @@ final class ConnectionWatchdog {
             });
         } catch (RejectedExecutionException exception) {
             future.completeExceptionally(exception);
+            return future;
         }
         socket.pingSendFuture = future;
         return future;
